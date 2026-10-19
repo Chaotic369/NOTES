@@ -1,0 +1,331 @@
+name: Build Windows EXE (Tauri v2)
+
+on:
+  workflow_dispatch:
+    inputs:
+      app_name:
+        description: "Application name (productName)"
+        required: false
+        default: "My App"
+        type: string
+      app_version:
+        description: "Application version (semver, e.g. 1.0.0)"
+        required: false
+        default: "1.0.0"
+        type: string
+      projects:
+        description: "'auto' or a comma-separated list of top-level folder names"
+        required: false
+        default: "auto"
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  discover:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.find.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Discover project folders
+        id: find
+        shell: bash
+        env:
+          PROJECTS_INPUT: ${{ github.event.inputs.projects || 'auto' }}
+        run: |
+          set -euo pipefail
+
+          trim() { printf '%s' "$1" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//'; }
+
+          raw="$(trim "$PROJECTS_INPUT")"
+          [ -z "$raw" ] && raw="auto"
+          lc="$(printf '%s' "$raw" | tr '[:upper:]' '[:lower:]')"
+
+          has_marker() {
+            [ -f "$1/src-tauri/tauri.conf.json" ] || [ -f "$1/package.json" ] || [ -f "$1/index.html" ]
+          }
+
+          projects=()
+          if [ "$lc" = "auto" ]; then
+            while IFS= read -r d; do
+              d="${d#./}"
+              case "$d" in
+                .*|node_modules) continue ;;
+              esac
+              if has_marker "$d"; then projects+=("$d"); fi
+            done < <(find . -mindepth 1 -maxdepth 1 -type d | sort)
+
+            if [ ${#projects[@]} -eq 0 ]; then
+              if has_marker "."; then
+                echo "No subfolder qualifies; using the repo root as the single project."
+                projects+=(".")
+              fi
+            fi
+          else
+            IFS=',' read -ra items <<< "$raw"
+            for item in "${items[@]}"; do
+              p="$(trim "$item")"
+              p="${p%/}"
+              p="${p#./}"
+              [ -z "$p" ] && continue
+              case "$p" in
+                /*|*..*)
+                  echo "::error::Invalid project folder name '$p'."
+                  exit 1
+                  ;;
+              esac
+              if [ ! -d "$p" ]; then
+                echo "::error::Project folder '$p' does not exist in the repository."
+                exit 1
+              fi
+              projects+=("$p")
+            done
+          fi
+
+          if [ ${#projects[@]} -eq 0 ]; then
+            echo "::error::No buildable projects found. A project folder needs src-tauri/tauri.conf.json, package.json or index.html (or set the 'projects' input to folder names)."
+            exit 1
+          fi
+
+          lines=""
+          while IFS= read -r p; do
+            if [ "$p" = "." ]; then prefix=""; else prefix="$p/"; fi
+            dep=""
+            if [ -f "${prefix}package-lock.json" ]; then
+              dep="${prefix}package-lock.json"
+            elif [ -f "${prefix}package.json" ]; then
+              dep="${prefix}package.json"
+            fi
+            lines+="$(printf '%s\t%s' "$p" "$dep")"$'\n'
+          done < <(printf '%s\n' "${projects[@]}" | awk '!seen[$0]++')
+
+          json="$(printf '%s' "$lines" | jq -R -s -c 'split("\n") | map(select(length > 0) | split("\t")) | map({project: .[0], dep: (.[1] // "")}) | {include: .}')"
+
+          echo "Projects to build:"
+          echo "$json" | jq .
+          echo "matrix=$json" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: discover
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.discover.outputs.matrix) }}
+    env:
+      APP_NAME: ${{ github.event.inputs.app_name || 'My App' }}
+      APP_VERSION: ${{ github.event.inputs.app_version || '1.0.0' }}
+      CARGO_TERM_COLOR: always
+      CARGO_INCREMENTAL: "0"
+    steps:
+      # Step 1
+      - uses: actions/checkout@v4
+
+      # Step 2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: ${{ matrix.dep != '' && 'npm' || '' }}
+          cache-dependency-path: ${{ matrix.dep }}
+
+      # Step 3
+      - uses: dtolnay/rust-toolchain@stable
+
+      # Step 4
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ${{ matrix.project }}/src-tauri
+
+      # Step 5
+      # The web files are staged into ./www inside the project folder, because pointing
+      # frontendDist at the project root itself would embed src-tauri and its target dir.
+      - name: Generate Tauri v2 wrapper for plain HTML projects
+        shell: pwsh
+        working-directory: ${{ matrix.project }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $name = $env:APP_NAME
+          if ((Test-Path 'index.html') -and -not (Test-Path 'src-tauri')) {
+            Write-Host "Generating minimal Tauri v2 wrapper for '${{ matrix.project }}'"
+            New-Item -ItemType Directory -Force -Path 'www', 'src-tauri/src' | Out-Null
+            Get-ChildItem -Path '.\*' -Force -Exclude '.*', 'node_modules', 'src-tauri', 'www', 'package.json', 'package-lock.json' |
+              Copy-Item -Recurse -Force -Destination 'www'
+
+            $conf = [ordered]@{
+              '$schema'   = 'https://schema.tauri.app/config/2'
+              productName = $name
+              version     = '0.0.0'
+              identifier  = 'com.chaotic369.notesapp'
+              build       = [ordered]@{ frontendDist = '../www' }
+              app         = [ordered]@{
+                windows  = @([ordered]@{ title = $name; width = 1000; height = 700 })
+                security = [ordered]@{ csp = $null }
+              }
+              bundle      = [ordered]@{
+                active = $false
+                icon   = @('icons/32x32.png', 'icons/128x128.png', 'icons/icon.ico')
+              }
+            }
+            $conf | ConvertTo-Json -Depth 10 | Set-Content -Path 'src-tauri/tauri.conf.json' -Encoding utf8
+
+            @'
+          [package]
+          name = "app"
+          version = "0.0.0"
+          edition = "2021"
+
+          [build-dependencies]
+          tauri-build = { version = "2", features = [] }
+
+          [dependencies]
+          tauri = { version = "2", features = [] }
+          '@ | Set-Content -Path 'src-tauri/Cargo.toml' -Encoding utf8
+
+            @'
+          fn main() {
+              tauri_build::build()
+          }
+          '@ | Set-Content -Path 'src-tauri/build.rs' -Encoding utf8
+
+            @'
+          #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
+          fn main() {
+              tauri::Builder::default()
+                  .run(tauri::generate_context!())
+                  .expect("error while running tauri application");
+          }
+          '@ | Set-Content -Path 'src-tauri/src/main.rs' -Encoding utf8
+          }
+
+          if (-not (Test-Path 'src-tauri/tauri.conf.json')) {
+            throw "Project '${{ matrix.project }}' has no src-tauri/tauri.conf.json and no index.html, so it cannot be built as a Tauri app."
+          }
+
+      # Step 6
+      - name: Patch productName and version
+        shell: pwsh
+        working-directory: ${{ matrix.project }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $name = $env:APP_NAME
+          $ver  = $env:APP_VERSION
+          if ($ver -notmatch '^\d+\.\d+\.\d+([-+][0-9A-Za-z.+-]+)?$') {
+            throw "app_version '$ver' is not a valid semantic version (example: 1.0.0)."
+          }
+
+          $confPath = 'src-tauri/tauri.conf.json'
+          $conf = Get-Content -Path $confPath -Raw | ConvertFrom-Json
+          $conf | Add-Member -NotePropertyName productName -NotePropertyValue $name -Force
+          $conf | Add-Member -NotePropertyName version -NotePropertyValue $ver -Force
+          $conf | ConvertTo-Json -Depth 100 | Set-Content -Path $confPath -Encoding utf8
+
+          $cargoPath = 'src-tauri/Cargo.toml'
+          if (Test-Path $cargoPath) {
+            $lines = Get-Content -Path $cargoPath
+            $inPackage = $false
+            $done = $false
+            for ($i = 0; $i -lt $lines.Count; $i++) {
+              if ($lines[$i] -match '^\s*\[(.+)\]\s*$') {
+                $inPackage = ($Matches[1].Trim() -eq 'package')
+                continue
+              }
+              if ($inPackage -and -not $done -and $lines[$i] -match '^\s*version\s*=\s*"') {
+                $lines[$i] = 'version = "' + $ver + '"'
+                $done = $true
+              }
+            }
+            Set-Content -Path $cargoPath -Value $lines -Encoding utf8
+          }
+          Write-Host "Patched productName='$name' version='$ver'"
+
+      # Step 7
+      - name: Ensure size-optimized release profile
+        shell: pwsh
+        working-directory: ${{ matrix.project }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $cargoPath = 'src-tauri/Cargo.toml'
+          $text = Get-Content -Path $cargoPath -Raw
+          if ($text -notmatch '(?m)^\s*\[profile\.release\]') {
+            $profile = @(
+              '',
+              '[profile.release]',
+              'opt-level = 3',
+              'lto = true',
+              'codegen-units = 1',
+              'panic = "abort"',
+              'strip = true',
+              ''
+            ) -join "`n"
+            Add-Content -Path $cargoPath -Value $profile -Encoding utf8
+            Write-Host "Added [profile.release] to $cargoPath"
+          } else {
+            Write-Host "[profile.release] already present"
+          }
+
+      - name: Install Tauri CLI v2 (so npx never resolves the wrong package)
+        shell: pwsh
+        run: |
+          npm install -g '@tauri-apps/cli@^2'
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      # Step 8
+      - name: Generate icons
+        shell: pwsh
+        working-directory: ${{ matrix.project }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $rootIcon = Join-Path $env:GITHUB_WORKSPACE 'build-icon.png'
+          if (Test-Path $rootIcon) {
+            Write-Host "Using $rootIcon"
+            npx tauri icon $rootIcon
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          } elseif (-not (Test-Path 'src-tauri/icons/icon.ico')) {
+            Write-Host "No build-icon.png and no project icons; generating a placeholder icon"
+            Add-Type -AssemblyName System.Drawing
+            $placeholder = Join-Path $env:RUNNER_TEMP 'placeholder-icon.png'
+            $bmp = New-Object System.Drawing.Bitmap 512, 512
+            $g = [System.Drawing.Graphics]::FromImage($bmp)
+            $g.Clear([System.Drawing.Color]::FromArgb(255, 45, 108, 223))
+            $g.Dispose()
+            $bmp.Save($placeholder, [System.Drawing.Imaging.ImageFormat]::Png)
+            $bmp.Dispose()
+            npx tauri icon $placeholder
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          } else {
+            Write-Host "Project already has icons; nothing to generate"
+          }
+
+      # Step 9
+      - name: Install npm dependencies
+        shell: pwsh
+        working-directory: ${{ matrix.project }}
+        run: |
+          if (Test-Path 'package.json') {
+            if (Test-Path 'package-lock.json') {
+              npm ci
+            } else {
+              npm install
+            }
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          } else {
+            Write-Host "No package.json; skipping npm install"
+          }
+
+      # Step 10
+      - name: Build release exe (no installer bundle)
+        shell: pwsh
+        working-directory: ${{ matrix.project }}
+        run: |
+          npx tauri build --no-bundle
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      # Step 11
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ github.event.inputs.app_name || 'My App' }}-${{ matrix.project }}
+          path: ${{ matrix.project }}/src-tauri/target/release/*.exe
+          if-no-files-found: error
